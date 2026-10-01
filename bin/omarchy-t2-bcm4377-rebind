@@ -10,14 +10,23 @@
 # more than once, brings it up. BlueZ can report Powered: yes while the class
 # stays 0x00000000 and scans find nothing — that happens at boot, not only
 # after suspend.
+#
+# An rfkill soft block is Omarchy's Bluetooth-off switch, not a hung chip.
+# power on fails while the block is held, and the saved switch is the file
+# systemd-rfkill will apply to this PCI function (pci-<bdf>:bluetooth).
 
 set -euo pipefail
 
 MAX_TRIES=${MAX_TRIES:-5}
-DRV=/sys/bus/pci/drivers/hci_bcm4377
+sys_root=${OMARCHY_T2_BCM4377_SYS:-/sys}
+rfkill_state=${OMARCHY_T2_BCM4377_RFKILL_STATE:-/var/lib/systemd/rfkill}
+unbind_sleep=${OMARCHY_T2_BCM4377_UNBIND_SLEEP:-2}
+bind_sleep=${OMARCHY_T2_BCM4377_BIND_SLEEP:-3}
+bluez_sleep=${OMARCHY_T2_BCM4377_BLUEZ_SLEEP:-3}
+drv=$sys_root/bus/pci/drivers/hci_bcm4377
 
 DEV=""
-for d in /sys/bus/pci/devices/*; do
+for d in "$sys_root"/bus/pci/devices/*; do
   [[ -r $d/vendor && -r $d/device ]] || continue
   if [[ $(<"$d/vendor") == "0x14e4" && $(<"$d/device") == "0x5fa0" ]]; then
     DEV=$(basename "$d")
@@ -30,37 +39,97 @@ if [[ -z $DEV ]]; then
   exit 0
 fi
 
-modprobe hci_bcm4377 2>/dev/null || true
+# Saved switch for this function, not for a USB dongle that shares the
+# bluetooth rfkill type. systemd-rfkill stores 1 for a soft block.
+persisted_bluetooth_blocked() {
+  local state
+  shopt -s nullglob
+  for state in "$rfkill_state"/*"$DEV"*:bluetooth; do
+    if [[ $(<"$state") == 1 ]]; then
+      shopt -u nullglob
+      return 0
+    fi
+  done
+  shopt -u nullglob
+  return 1
+}
 
-# Returns 0 only if BlueZ says powered *and* the adapter class is set.
-# A hung BCM4377 still reports Powered: yes with Class: 0x00000000 (0).
+# Live switch on the hci node that hangs off the BCM4377 PCI function.
+adapter_rfkill_blocked() {
+  local node soft hard
+  shopt -s nullglob
+  for node in "$sys_root/bus/pci/devices/$DEV/bluetooth"/hci*/rfkill*/soft; do
+    [[ -r $node ]] || continue
+    soft=$(<"$node")
+    hard=$(<"${node%/soft}/hard")
+    if [[ $soft == 1 || $hard == 1 ]]; then
+      shopt -u nullglob
+      return 0
+    fi
+  done
+  shopt -u nullglob
+  return 1
+}
+
+bcm_hci_name() {
+  local hci
+  shopt -s nullglob
+  for hci in "$sys_root/bus/pci/devices/$DEV/bluetooth"/hci*; do
+    [[ -d $hci ]] || continue
+    basename "$hci"
+    shopt -u nullglob
+    return 0
+  done
+  shopt -u nullglob
+  return 1
+}
+
+# 0 only when this function's own controller is powered and has a real class.
+# The hci index comes from the PCI device, so a USB dongle enumerated as hci0
+# is not the adapter under test. bluetoothctl is the wrong tool here: `show`
+# with no argument is the default controller, `show hci0` is rejected, and
+# `show <mac>` prints the record and then does not exit.
 alive() {
-  [[ -e /sys/class/bluetooth/hci0 ]] || return 1
-  timeout 5 bluetoothctl power on >/dev/null 2>&1 || true
-  local show
-  show=$(timeout 5 bluetoothctl show 2>/dev/null) || return 1
-  echo "$show" | grep -q 'Powered: yes' || return 1
-  echo "$show" | grep -q 'Class: 0x00000000' && return 1
+  local hci powered class
+  hci=$(bcm_hci_name) || return 1
+  timeout 5 busctl set-property org.bluez "/org/bluez/$hci" org.bluez.Adapter1 Powered b true >/dev/null 2>&1 || true
+  powered=$(timeout 5 busctl get-property org.bluez "/org/bluez/$hci" org.bluez.Adapter1 Powered 2>/dev/null) || return 1
+  [[ $powered == "b true" ]] || return 1
+  class=$(timeout 5 busctl get-property org.bluez "/org/bluez/$hci" org.bluez.Adapter1 Class 2>/dev/null) || return 1
+  # bluetoothctl prints this as "Class: 0x00000000". Powered can already be true.
+  [[ $class == "u 0" ]] && return 1
   return 0
 }
 
+if persisted_bluetooth_blocked; then
+  echo "omarchy-t2-bcm4377-rebind: $DEV Bluetooth is rfkill-blocked, leaving it off"
+  exit 0
+fi
+
+modprobe hci_bcm4377 2>/dev/null || true
+
+if adapter_rfkill_blocked || persisted_bluetooth_blocked; then
+  echo "omarchy-t2-bcm4377-rebind: $DEV Bluetooth is rfkill-blocked, leaving it off"
+  exit 0
+fi
+
 if alive; then
-  echo "omarchy-t2-bcm4377-rebind: $DEV already powered, nothing to do"
+  echo "omarchy-t2-bcm4377-rebind: $DEV already usable, nothing to do"
   exit 0
 fi
 
 for i in $(seq 1 "$MAX_TRIES"); do
   echo "omarchy-t2-bcm4377-rebind: attempt $i/$MAX_TRIES on $DEV"
-  if [[ -L /sys/bus/pci/devices/$DEV/driver ]]; then
-    echo "$DEV" >"$DRV/unbind" 2>/dev/null || true
-    sleep 2
+  if [[ -L $sys_root/bus/pci/devices/$DEV/driver ]]; then
+    echo "$DEV" >"$drv/unbind" 2>/dev/null || true
+    sleep "$unbind_sleep"
   fi
-  echo "$DEV" >"$DRV/bind" 2>/dev/null || true
-  sleep 3
-  systemctl restart bluetooth.service
-  sleep 3
+  echo "$DEV" >"$drv/bind" 2>/dev/null || true
+  sleep "$bind_sleep"
+  systemctl restart bluetooth.service || true
+  sleep "$bluez_sleep"
   if alive; then
-    echo "omarchy-t2-bcm4377-rebind: Bluetooth powered on after attempt $i"
+    echo "omarchy-t2-bcm4377-rebind: Bluetooth usable after attempt $i"
     exit 0
   fi
 done

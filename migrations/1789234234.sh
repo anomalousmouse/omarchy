@@ -2,8 +2,10 @@ echo "Rebind BCM4377 Bluetooth after boot and unload the combo chip around suspe
 
 # Existing T2 installs load hci_bcm4377 but leave a hung adapter (Powered: yes,
 # class 0x00000000) and cannot suspend: brcmfmac times out entering D3. Gate on
-# the combo PCI IDs so other T2 chips are left alone. See
-# install/hardware/apple/fix-t2-bcm4377.sh and omacom/omarchy#11264.
+# the combo PCI IDs so other T2 chips are left alone. A published t2-wifi-suspend
+# hook is removed by content; any other file under that name is kept, not
+# executable. See install/hardware/apple/fix-t2-bcm4377.sh and
+# omacom/omarchy#11264.
 
 as_root() {
   if (( EUID == 0 )); then

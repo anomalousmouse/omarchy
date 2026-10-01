@@ -1,0 +1,10 @@
+[Unit]
+Description=Reload BCM4377 Wi-Fi after resume and rebind Bluetooth
+Documentation=https://github.com/omacom/omarchy/issues/11264
+# Started by omarchy-t2-bcm4377-suspend after wake. Not installed into a
+# boot target: systemctl restart of this name is what a second wake reuses.
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/omarchy-t2-bcm4377-suspend resume
+TimeoutStartSec=60

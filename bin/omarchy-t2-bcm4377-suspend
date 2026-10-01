@@ -2,7 +2,7 @@
 
 # omarchy:summary=Unload BCM4377 Wi-Fi and Bluetooth around suspend
 # omarchy:group=hw
-# omarchy:args=<pre|post>
+# omarchy:args=<pre|post|resume|recover>
 # omarchy:hidden=true
 # omarchy:requires-sudo=true
 
@@ -13,20 +13,41 @@
 #
 # hci_bcm4377 must be unloaded too. Left bound, it wakes hung and later raises
 # a PCIe error that DPC-isolates the whole combo chip (Wi-Fi dies until reboot).
-# Stop bluetoothd first so the module can actually leave.
+# If that unload fails, suspend does not proceed: sleeping with the function
+# still bound is that DPC failure.
 #
-# Reloading brcmfmac the instant the system wakes has hard-crashed this chip.
-# Defer that reload ~15s, then rebind Bluetooth.
+# ExecStop runs only after a successful start, and only once
+# systemd-suspend.service has returned, so the PCI function is resuming.
+# Probing brcmfmac from a systemd-sleep hook, before that, has hard-crashed
+# this chip. Waiting until the Wi-Fi function reports D0 is the signal that
+# resume has finished; the reload is then immediate. A fixed delay is not
+# required on that path, and a packaged oneshot (systemctl restart) is what
+# a second wake reuses. A transient unit keeps one name, so a wake followed
+# by another suspend inside the reload skips the next one entirely.
+#
+# A failed or timed-out pre never gets ExecStop. pre puts Bluetooth back
+# before it returns failure, and RequiredBy=sleep.target keeps the machine
+# out of suspend. OnFailure runs recover for the case where the process is
+# killed before it can do that itself.
 
 set -euo pipefail
 
+sys_root=${OMARCHY_T2_BCM4377_SYS:-/sys}
+run_root=${OMARCHY_T2_BCM4377_RUN:-/run}
+rfkill_state=${OMARCHY_T2_BCM4377_RFKILL_STATE:-/var/lib/systemd/rfkill}
+wifi_retry_sleep=${OMARCHY_T2_BCM4377_WIFI_RETRY_SLEEP:-0.4}
+d0_sleep=${OMARCHY_T2_BCM4377_D0_SLEEP:-0.1}
+d0_tries=${OMARCHY_T2_BCM4377_D0_TRIES:-50}
+iface_tries=${OMARCHY_T2_BCM4377_IFACE_TRIES:-20}
+stamp=$run_root/omarchy-t2-bcm4377-unloaded
+
 has_bcm4377() {
   local dev
-  for dev in /sys/bus/pci/devices/*; do
+  for dev in "$sys_root"/bus/pci/devices/*; do
     [[ -r $dev/vendor && -r $dev/device ]] || continue
     if [[ $(<"$dev/vendor") == "0x14e4" ]]; then
       case $(<"$dev/device") in
-        0x4488|0x5fa0) return 0 ;;
+        0x4488 | 0x5fa0) return 0 ;;
       esac
     fi
   done
@@ -34,12 +55,12 @@ has_bcm4377() {
 }
 
 loaded() {
-  [[ -d /sys/module/$1 ]]
+  [[ -d $sys_root/module/$1 ]]
 }
 
 wifi_ifaces() {
   local path driver
-  for path in /sys/class/net/*/device/driver; do
+  for path in "$sys_root"/class/net/*/device/driver; do
     [[ -e $path ]] || continue
     driver=$(basename "$(readlink -f "$path")")
     [[ $driver == "brcmfmac" ]] || continue
@@ -55,55 +76,218 @@ release_wifi() {
   done
 }
 
+# Stop Bluetooth, then the module. A busy hci_bcm4377 is a failed pre: the
+# caller must not go on to drop brcmfmac and must not report success.
 unload_bluetooth() {
+  local attempt
   loaded hci_bcm4377 || return 0
   systemctl stop bluetooth.service >/dev/null 2>&1 || true
-  modprobe -r hci_bcm4377 || true
-  if loaded hci_bcm4377; then
-    echo "warning: failed to unload hci_bcm4377" >&2
-  else
-    echo "unloaded hci_bcm4377 before suspend"
+  for attempt in 1 2 3; do
+    if ! loaded hci_bcm4377 || modprobe -r hci_bcm4377; then
+      echo "unloaded hci_bcm4377 before suspend (attempt $attempt)"
+      return 0
+    fi
+    sleep "$wifi_retry_sleep"
+  done
+  echo "failed to unload hci_bcm4377; refusing to suspend with it bound" >&2
+  return 1
+}
+
+unload_wifi() {
+  local attempt
+  loaded brcmfmac || return 0
+  for attempt in 1 2 3 4 5; do
+    loaded brcmfmac_wcc && modprobe -r brcmfmac_wcc || true
+    if ! loaded brcmfmac || modprobe -r brcmfmac; then
+      echo "unloaded brcmfmac before suspend (attempt $attempt)"
+      return 0
+    fi
+    sleep "$wifi_retry_sleep"
+  done
+  echo "failed to unload brcmfmac; BCM4377 will abort suspend" >&2
+  return 1
+}
+
+# Freshly loaded hci_bcm4377 often probes hung, so a restore that had to
+# modprobe it asks the rebind unit to finish the job. A module that never
+# unloaded is left on its own: rebind would cycle a chip that is merely busy.
+restore_bluetooth() {
+  local freshly_loaded=0
+  if ! loaded hci_bcm4377; then
+    modprobe hci_bcm4377 2>/dev/null || true
+    freshly_loaded=1
   fi
+  systemctl start bluetooth.service >/dev/null 2>&1 || true
+  if ((freshly_loaded)); then
+    systemctl start --no-block omarchy-t2-bcm4377-rebind.service >/dev/null 2>&1 || true
+  fi
+}
+
+mark_unloaded() {
+  mkdir -p "${stamp%/*}"
+  : >"$stamp"
+}
+
+# A reload or rebind still running from the previous wake will have the
+# modules open. Stop both before unloading. Bound the wait: a rebind stuck
+# in an uninterruptible sysfs write can ignore SIGKILL for a while.
+cancel_inflight() {
+  timeout 20 systemctl stop \
+    omarchy-t2-bcm4377-reload.service \
+    omarchy-t2-bcm4377-reload.timer \
+    omarchy-t2-bcm4377-rebind.service \
+    omarchy-t2-bcm4377-recover.service \
+    t2-wifi-reload.service \
+    t2-wifi-reload.timer \
+    bt-bcm4377-rebind.service \
+    >/dev/null 2>&1 || true
+  systemctl reset-failed \
+    omarchy-t2-bcm4377-reload.service \
+    omarchy-t2-bcm4377-rebind.service \
+    omarchy-t2-bcm4377-recover.service \
+    t2-wifi-reload.service \
+    bt-bcm4377-rebind.service \
+    >/dev/null 2>&1 || true
+}
+
+persist_wifi_unblocked() {
+  local state
+  shopt -s nullglob
+  for state in "$rfkill_state"/*:wlan; do
+    printf '0\n' >"$state" || true
+  done
+  shopt -u nullglob
+}
+
+wait_for_wifi_iface() {
+  local i
+  for i in $(seq 1 "$iface_tries"); do
+    [[ -n $(wifi_ifaces) ]] && return 0
+    sleep "$d0_sleep"
+  done
+  return 1
+}
+
+# Wi-Fi function only. Bluetooth being in D0 is not this signal.
+wait_for_pci_wifi_d0() {
+  local i dev
+  for i in $(seq 1 "$d0_tries"); do
+    for dev in "$sys_root"/bus/pci/devices/*; do
+      [[ -r $dev/vendor && -r $dev/device && -r $dev/power_state ]] || continue
+      [[ $(<"$dev/vendor") == "0x14e4" && $(<"$dev/device") == "0x4488" ]] || continue
+      if [[ $(<"$dev/power_state") == D0 ]]; then
+        return 0
+      fi
+    done
+    sleep "$d0_sleep"
+  done
+  echo "warning: BCM4377 Wi-Fi PCI function not in D0" >&2
+  return 1
+}
+
+load_wifi() {
+  local attempt
+  for attempt in 1 2 3; do
+    if modprobe brcmfmac; then
+      modprobe brcmfmac_wcc 2>/dev/null || true
+      return 0
+    fi
+    sleep "$wifi_retry_sleep"
+  done
+  echo "failed to load brcmfmac" >&2
+  return 1
+}
+
+# systemd-rfkill restores the saved switch onto the new killswitch. The last
+# save during an unload can be "blocked", which would turn the radio straight
+# back off. Write unblocked around the load, for the wlan switch only.
+bring_wifi_up() {
+  persist_wifi_unblocked
+  systemctl stop systemd-rfkill.service >/dev/null 2>&1 || true
+  persist_wifi_unblocked
+  load_wifi
+  wait_for_wifi_iface || true
+  rfkill unblock wlan >/dev/null 2>&1 || true
+  if command -v nmcli >/dev/null 2>&1; then
+    nmcli radio wifi on >/dev/null 2>&1 || true
+  fi
+  persist_wifi_unblocked
 }
 
 pre() {
   has_bcm4377 || exit 0
 
-  unload_bluetooth
+  # A stamp left from an earlier cycle must not look like this attempt finished.
+  rm -f "$stamp"
+  cancel_inflight
 
-  loaded brcmfmac || exit 0
+  if ! unload_bluetooth; then
+    restore_bluetooth
+    exit 1
+  fi
+
+  if ! loaded brcmfmac; then
+    mark_unloaded
+    exit 0
+  fi
 
   release_wifi
+  if unload_wifi; then
+    mark_unloaded
+    exit 0
+  fi
 
-  local attempt
-  for attempt in 1 2 3 4 5; do
-    loaded brcmfmac_wcc && modprobe -r brcmfmac_wcc || true
-    if ! loaded brcmfmac || modprobe -r brcmfmac; then
-      echo "unloaded brcmfmac before suspend (attempt $attempt)"
-      exit 0
-    fi
-    sleep 0.4
-  done
-
-  echo "failed to unload brcmfmac; BCM4377 will abort suspend" >&2
+  restore_bluetooth
   exit 1
 }
 
 post() {
   has_bcm4377 || exit 0
 
-  systemctl stop t2-wifi-reload.service t2-wifi-reload.timer \
-    omarchy-t2-bcm4377-reload.service omarchy-t2-bcm4377-reload.timer >/dev/null 2>&1 || true
-  systemd-run --collect --on-active=15s --unit=omarchy-t2-bcm4377-reload \
-    /bin/bash -c 'modprobe brcmfmac; modprobe brcmfmac_wcc || true; systemctl start omarchy-t2-bcm4377-rebind.service'
-  echo "scheduled brcmfmac/bluetooth reload in 15s"
+  # A rebind that survived pre (or was started at boot and is still in its
+  # sysfs write) must not race the reload that is about to own the chip.
+  timeout 20 systemctl stop \
+    omarchy-t2-bcm4377-rebind.service \
+    bt-bcm4377-rebind.service \
+    >/dev/null 2>&1 || true
+  systemctl reset-failed omarchy-t2-bcm4377-reload.service >/dev/null 2>&1 || true
+  systemctl restart --no-block omarchy-t2-bcm4377-reload.service
+  rm -f "$stamp"
+  echo "scheduled brcmfmac reload and Bluetooth rebind"
+}
+
+resume() {
+  has_bcm4377 || exit 0
+
+  wait_for_pci_wifi_d0 || true
+  bring_wifi_up
+  systemctl start --no-block omarchy-t2-bcm4377-rebind.service >/dev/null 2>&1 || true
+  echo "reloaded brcmfmac after resume"
+}
+
+# Backstop when pre or post is killed. A reload that is already running owns
+# the bring-up; otherwise load now. This is the same D0 wait as a normal
+# wake, including when suspend was aborted and the function never left D0.
+recover() {
+  has_bcm4377 || exit 0
+
+  if systemctl is-active --quiet omarchy-t2-bcm4377-reload.service; then
+    exit 0
+  fi
+
+  if [[ -f $stamp ]] || ! loaded brcmfmac || ! loaded hci_bcm4377; then
+    rm -f "$stamp"
+    resume
+  fi
 }
 
 case "${1:-}" in
   pre) pre ;;
   post) post ;;
+  resume) resume ;;
+  recover) recover ;;
   *)
-    echo "usage: omarchy-t2-bcm4377-suspend <pre|post>" >&2
+    echo "usage: omarchy-t2-bcm4377-suspend <pre|post|resume|recover>" >&2
     exit 2
     ;;
 esac
