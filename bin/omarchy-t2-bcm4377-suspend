@@ -19,16 +19,22 @@
 # ExecStop runs only after a successful start, and only once
 # systemd-suspend.service has returned, so the PCI function is resuming.
 # Probing brcmfmac from a systemd-sleep hook, before that, has hard-crashed
-# this chip. Waiting until the Wi-Fi function reports D0 is the signal that
-# resume has finished; the reload is then immediate. A fixed delay is not
-# required on that path, and a packaged oneshot (systemctl restart) is what
-# a second wake reuses. A transient unit keeps one name, so a wake followed
-# by another suspend inside the reload skips the next one entirely.
+# this chip. The reload waits until the Wi-Fi function reports D0 and does
+# not probe if that wait runs out. A fixed delay is not required on that
+# path, and a packaged oneshot (systemctl restart) is what a second wake
+# reuses. A transient unit keeps one name, so a wake followed by another
+# suspend inside the reload skips the next one entirely.
 #
-# A failed or timed-out pre never gets ExecStop. pre puts Bluetooth back
+# A failed or timed-out pre never gets ExecStop. pre puts the radios back
 # before it returns failure, and RequiredBy=sleep.target keeps the machine
-# out of suspend. OnFailure runs recover for the case where the process is
-# killed before it can do that itself.
+# out of suspend. OnFailure runs recover when the process is killed before
+# it can do that itself. The reload unit retries a failed resume, then
+# hands the last try to the same recover unit.
+#
+# The user's Wi-Fi-off switch is the BCM4377 wlan rfkill, including the
+# state systemd-rfkill has saved for that PCI function, and NetworkManager's
+# wifi radio. Resume restores that switch. It does not unblock other
+# adapters, and it does not turn the radio on when the user had turned it off.
 
 set -euo pipefail
 
@@ -40,6 +46,8 @@ d0_sleep=${OMARCHY_T2_BCM4377_D0_SLEEP:-0.1}
 d0_tries=${OMARCHY_T2_BCM4377_D0_TRIES:-50}
 iface_tries=${OMARCHY_T2_BCM4377_IFACE_TRIES:-20}
 stamp=$run_root/omarchy-t2-bcm4377-unloaded
+wlan_off_stamp=$run_root/omarchy-t2-bcm4377-wlan-off
+released_stamp=$run_root/omarchy-t2-bcm4377-wifi-released
 
 has_bcm4377() {
   local dev
@@ -68,12 +76,120 @@ wifi_ifaces() {
   done
 }
 
+wifi_bdf() {
+  local dev
+  for dev in "$sys_root"/bus/pci/devices/*; do
+    [[ -r $dev/vendor && -r $dev/device ]] || continue
+    if [[ $(<"$dev/vendor") == "0x14e4" && $(<"$dev/device") == "0x4488" ]]; then
+      basename "$dev"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Live switch on the rfkill node under the Wi-Fi function. A USB adapter's
+# wlan killswitch is not this node.
+adapter_wlan_blocked() {
+  local bdf node soft hard
+  bdf=$(wifi_bdf) || return 1
+  shopt -s nullglob
+  for node in "$sys_root/bus/pci/devices/$bdf"/ieee80211/phy*/rfkill*/soft; do
+    [[ -r $node ]] || continue
+    soft=$(<"$node")
+    hard=$(<"${node%/soft}/hard")
+    if [[ $soft == 1 || $hard == 1 ]]; then
+      shopt -u nullglob
+      return 0
+    fi
+  done
+  shopt -u nullglob
+  return 1
+}
+
+# Saved switch for this function. systemd-rfkill stores 1 for a soft block.
+persisted_wlan_blocked() {
+  local bdf state
+  bdf=$(wifi_bdf) || return 1
+  shopt -s nullglob
+  for state in "$rfkill_state"/*"$bdf"*:wlan; do
+    if [[ $(<"$state") == 1 ]]; then
+      shopt -u nullglob
+      return 0
+    fi
+  done
+  shopt -u nullglob
+  return 1
+}
+
+nm_wifi_disabled() {
+  local state
+  command -v nmcli >/dev/null 2>&1 || return 1
+  state=$(nmcli radio wifi 2>/dev/null || true)
+  [[ $state == *disabled* ]]
+}
+
+# Snapshot before release_wifi. Unloading the module drops the killswitch,
+# and systemd-rfkill can save that disappearance as "blocked".
+remember_wifi_switch() {
+  rm -f "$wlan_off_stamp"
+  if persisted_wlan_blocked || adapter_wlan_blocked || nm_wifi_disabled; then
+    mkdir -p "${wlan_off_stamp%/*}"
+    : >"$wlan_off_stamp"
+  fi
+}
+
+persist_wlan() {
+  local value=$1 bdf state found=0
+  bdf=$(wifi_bdf) || return 0
+  [[ -d $rfkill_state ]] || return 0
+  shopt -s nullglob
+  for state in "$rfkill_state"/*"$bdf"*:wlan; do
+    printf '%s\n' "$value" >"$state" || true
+    found=1
+  done
+  shopt -u nullglob
+  if ((found == 0)); then
+    printf '%s\n' "$value" >"$rfkill_state/pci-$bdf:wlan" || true
+  fi
+}
+
+set_bcm_wlan_soft() {
+  local value=$1 bdf node
+  bdf=$(wifi_bdf) || return 0
+  shopt -s nullglob
+  for node in "$sys_root/bus/pci/devices/$bdf"/ieee80211/phy*/rfkill*/soft; do
+    printf '%s\n' "$value" >"$node" || true
+  done
+  shopt -u nullglob
+}
+
 release_wifi() {
-  local iface
+  local iface released=0
   for iface in $(wifi_ifaces); do
     nmcli device disconnect "$iface" >/dev/null 2>&1 || true
     ip link set "$iface" down >/dev/null 2>&1 || true
+    released=1
   done
+  if ((released)); then
+    mkdir -p "${released_stamp%/*}"
+    : >"$released_stamp"
+  fi
+}
+
+# Undo release_wifi when suspend did not happen. Leave a user-off radio down.
+restore_wifi() {
+  local iface
+  [[ -f $released_stamp ]] || return 0
+  if [[ ! -f $wlan_off_stamp ]]; then
+    for iface in $(wifi_ifaces); do
+      ip link set "$iface" up >/dev/null 2>&1 || true
+      if command -v nmcli >/dev/null 2>&1; then
+        nmcli device connect "$iface" >/dev/null 2>&1 || true
+      fi
+    done
+  fi
+  rm -f "$released_stamp"
 }
 
 # Stop Bluetooth, then the module. A busy hci_bcm4377 is a failed pre: the
@@ -150,15 +266,6 @@ cancel_inflight() {
     >/dev/null 2>&1 || true
 }
 
-persist_wifi_unblocked() {
-  local state
-  shopt -s nullglob
-  for state in "$rfkill_state"/*:wlan; do
-    printf '0\n' >"$state" || true
-  done
-  shopt -u nullglob
-}
-
 wait_for_wifi_iface() {
   local i
   for i in $(seq 1 "$iface_tries"); do
@@ -199,19 +306,28 @@ load_wifi() {
 }
 
 # systemd-rfkill restores the saved switch onto the new killswitch. The last
-# save during an unload can be "blocked", which would turn the radio straight
-# back off. Write unblocked around the load, for the wlan switch only.
+# save during an unload can be "blocked" even when the user had Wi-Fi on.
+# Rewrite only this function's wlan file, and only towards the switch sampled
+# before the unload. A user-off radio stays off, including NetworkManager's.
 bring_wifi_up() {
-  persist_wifi_unblocked
+  local value=0
+  if [[ -f $wlan_off_stamp ]]; then
+    value=1
+  fi
+  persist_wlan "$value"
   systemctl stop systemd-rfkill.service >/dev/null 2>&1 || true
-  persist_wifi_unblocked
+  persist_wlan "$value"
   load_wifi
+  set_bcm_wlan_soft "$value"
+  if [[ $value == 1 ]]; then
+    persist_wlan 1
+    return 0
+  fi
   wait_for_wifi_iface || true
-  rfkill unblock wlan >/dev/null 2>&1 || true
   if command -v nmcli >/dev/null 2>&1; then
     nmcli radio wifi on >/dev/null 2>&1 || true
   fi
-  persist_wifi_unblocked
+  persist_wlan 0
 }
 
 pre() {
@@ -219,6 +335,7 @@ pre() {
 
   # A stamp left from an earlier cycle must not look like this attempt finished.
   rm -f "$stamp"
+  remember_wifi_switch
   cancel_inflight
 
   if ! unload_bluetooth; then
@@ -233,10 +350,12 @@ pre() {
 
   release_wifi
   if unload_wifi; then
+    rm -f "$released_stamp"
     mark_unloaded
     exit 0
   fi
 
+  restore_wifi
   restore_bluetooth
   exit 1
 }
@@ -259,15 +378,19 @@ post() {
 resume() {
   has_bcm4377 || exit 0
 
-  wait_for_pci_wifi_d0 || true
+  if ! wait_for_pci_wifi_d0; then
+    echo "BCM4377 Wi-Fi function is not in D0; refusing to probe brcmfmac" >&2
+    return 1
+  fi
   bring_wifi_up
   systemctl start --no-block omarchy-t2-bcm4377-rebind.service >/dev/null 2>&1 || true
   echo "reloaded brcmfmac after resume"
 }
 
-# Backstop when pre or post is killed. A reload that is already running owns
-# the bring-up; otherwise load now. This is the same D0 wait as a normal
-# wake, including when suspend was aborted and the function never left D0.
+# Backstop when pre, post, or the reload is killed or fails. A reload that
+# is already running owns the bring-up. Missing modules take the normal D0
+# resume. Modules that never left can still be missing BlueZ or the link,
+# which is a killed pre that stopped after release and before the unload.
 recover() {
   has_bcm4377 || exit 0
 
@@ -276,9 +399,15 @@ recover() {
   fi
 
   if [[ -f $stamp ]] || ! loaded brcmfmac || ! loaded hci_bcm4377; then
-    rm -f "$stamp"
+    rm -f "$stamp" "$released_stamp"
     resume
+    return
   fi
+
+  if ! systemctl is-active --quiet bluetooth.service; then
+    systemctl start bluetooth.service >/dev/null 2>&1 || true
+  fi
+  restore_wifi
 }
 
 case "${1:-}" in

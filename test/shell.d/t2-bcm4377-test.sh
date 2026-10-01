@@ -42,6 +42,12 @@ grep -q 'omarchy-t2-bcm4377-reload.service' "$suspend" ||
   fail "the reload unit has no sleep before it loads brcmfmac"
 grep -q 'wait_for_pci_wifi_d0' "$suspend" ||
   fail "reload waits until the Wi-Fi function is in D0"
+grep -q 'OnFailure=omarchy-t2-bcm4377-recover.service' "$reload_unit" ||
+  fail "a failed reload is handed to recover"
+grep -q 'Restart=on-failure' "$reload_unit" ||
+  fail "a failed reload is retried"
+! grep -q 'rfkill unblock wlan' "$suspend" ||
+  fail "resume does not unblock every Wi-Fi adapter"
 pass "BCM4377 setup is a dedicated leaf with a class-aware rebind"
 
 test_tmp=$(mktemp -d)
@@ -153,6 +159,9 @@ if [[ ${1:-} == -r ]]; then
 fi
 for module in "$@"; do
   [[ $module == -* ]] && continue
+  if [[ $module == brcmfmac && ${FAIL_LOAD:-0} == 1 ]]; then
+    exit 1
+  fi
   if [[ $module == brcmfmac && -f $sys/bus/pci/devices/0000:73:00.0/power_state ]]; then
     printf 'power_state=%s\n' "$(<"$sys/bus/pci/devices/0000:73:00.0/power_state")" >>"$TEST_LOG"
   fi
@@ -197,7 +206,19 @@ fi
 exit 1
 SH
 
-for cmd in nmcli ip rfkill; do
+cat >"$helper_bin/nmcli" <<'SH'
+#!/bin/bash
+
+printf '%s' "$0" >>"$TEST_LOG"
+printf '\t%s' "$@" >>"$TEST_LOG"
+printf '\n' >>"$TEST_LOG"
+if [[ ${1:-} == radio && ${2:-} == wifi && ${3:-} != on ]]; then
+  printf '%s\n' "${NM_WIFI_RADIO:-enabled}"
+fi
+exit 0
+SH
+
+for cmd in ip rfkill; do
   cat >"$helper_bin/$cmd" <<'SH'
 #!/bin/bash
 
@@ -332,18 +353,24 @@ pass "the migration skips T2 Macs without BCM4377"
 setup_sysfs() {
   rm -rf "$sys" "$run" "$rfkill_dir"
   mkdir -p \
-    "$sys/bus/pci/devices/0000:73:00.0" \
+    "$sys/bus/pci/devices/0000:73:00.0/ieee80211/phy0/rfkill1" \
     "$sys/bus/pci/devices/0000:73:00.1/bluetooth/hci1/rfkill0" \
     "$sys/bus/pci/drivers/hci_bcm4377" \
+    "$sys/bus/pci/drivers/brcmfmac" \
     "$sys/module/brcmfmac" \
     "$sys/module/brcmfmac_wcc" \
     "$sys/module/hci_bcm4377" \
-    "$sys/class/net" \
+    "$sys/class/net/wlp115s0f0/device" \
     "$run" \
     "$rfkill_dir"
+  ln -sfn "$sys/bus/pci/drivers/brcmfmac" "$sys/class/net/wlp115s0f0/device/driver"
   printf '0x14e4\n' >"$sys/bus/pci/devices/0000:73:00.0/vendor"
   printf '0x4488\n' >"$sys/bus/pci/devices/0000:73:00.0/device"
   printf 'D0\n' >"$sys/bus/pci/devices/0000:73:00.0/power_state"
+  printf '0\n' >"$sys/bus/pci/devices/0000:73:00.0/ieee80211/phy0/rfkill1/soft"
+  printf '0\n' >"$sys/bus/pci/devices/0000:73:00.0/ieee80211/phy0/rfkill1/hard"
+  printf '0\n' >"$rfkill_dir/pci-0000:73:00.0:wlan"
+  printf '1\n' >"$rfkill_dir/pci-0000:01:00.0:wlan"
   printf '0x14e4\n' >"$sys/bus/pci/devices/0000:73:00.1/vendor"
   printf '0x5fa0\n' >"$sys/bus/pci/devices/0000:73:00.1/device"
   printf '0\n' >"$sys/bus/pci/devices/0000:73:00.1/bluetooth/hci1/rfkill0/soft"
@@ -374,6 +401,8 @@ run_helper() {
     export MAX_TRIES="${MAX_TRIES:-5}"
     export FAIL_HCI="${FAIL_HCI:-0}"
     export FAIL_WIFI="${FAIL_WIFI:-0}"
+    export FAIL_LOAD="${FAIL_LOAD:-0}"
+    export NM_WIFI_RADIO="${NM_WIFI_RADIO:-enabled}"
     export RELOAD_ACTIVE="${RELOAD_ACTIVE:-0}"
     export BCM_POWERED="${BCM_POWERED:-b true}"
     export BCM_CLASS="${BCM_CLASS:-u 7078156}"
@@ -426,6 +455,10 @@ stop_line=$(grep -F $'systemctl\tstop\t' "$calls" | head -1)
 [[ ! -d $sys/module/hci_bcm4377 ]] || fail "pre unloads hci_bcm4377"
 [[ ! -d $sys/module/brcmfmac ]] || fail "pre unloads brcmfmac"
 [[ -f $run/omarchy-t2-bcm4377-unloaded ]] || fail "a successful unload marks itself for resume"
+[[ ! -f $run/omarchy-t2-bcm4377-wifi-released ]] ||
+  fail "a successful unload clears the dropped-link stamp"
+[[ ! -f $run/omarchy-t2-bcm4377-wlan-off ]] ||
+  fail "Wi-Fi that was on is not remembered as off"
 pass "pre stops in-flight resume work, then unloads both modules"
 
 setup_sysfs
@@ -460,7 +493,13 @@ grep -Fq $'systemctl\tstart\tbluetooth.service' "$calls" ||
 grep -Fq $'systemctl\tstart\t--no-block\tomarchy-t2-bcm4377-rebind.service' "$calls" ||
   fail "a Bluetooth module loaded again on the failure path is rebound" "$(cat "$calls")"
 [[ ! -f $run/omarchy-t2-bcm4377-unloaded ]] || fail "a failed Wi-Fi unload does not mark itself successful"
-pass "a failed brcmfmac unload restores Bluetooth and aborts suspend"
+log_before $'nmcli\tdevice\tdisconnect\twlp115s0f0' $'nmcli\tdevice\tconnect\twlp115s0f0' ||
+  fail "a failed Wi-Fi unload reconnects the interface it dropped" "$(cat "$calls")"
+log_before $'ip\tlink\tset\twlp115s0f0\tdown' $'ip\tlink\tset\twlp115s0f0\tup' ||
+  fail "a failed Wi-Fi unload brings the interface back up" "$(cat "$calls")"
+[[ ! -f $run/omarchy-t2-bcm4377-wifi-released ]] ||
+  fail "a failed Wi-Fi unload clears the dropped-link stamp"
+pass "a failed brcmfmac unload restores Wi-Fi and Bluetooth and aborts suspend"
 
 setup_sysfs
 printf 'x' >"$run/omarchy-t2-bcm4377-unloaded"
@@ -496,9 +535,64 @@ grep -Fq 'power_state=D3' "$calls" &&
   fail "brcmfmac is not loaded while the Wi-Fi function is still in D3" "$(cat "$calls")"
 grep -Fq $'systemctl\tstart\t--no-block\tomarchy-t2-bcm4377-rebind.service' "$calls" ||
   fail "resume starts the Bluetooth rebind" "$(cat "$calls")"
-grep -Fq $'rfkill\tunblock\twlan' "$calls" ||
-  fail "resume unblocks the Wi-Fi killswitch" "$(cat "$calls")"
+grep -Fq $'nmcli\tradio\twifi\ton' "$calls" ||
+  fail "resume turns the Wi-Fi radio on when it was on before suspend" "$(cat "$calls")"
+grep -Fq $'rfkill\tunblock' "$calls" &&
+  fail "resume does not unblock every Wi-Fi adapter" "$(cat "$calls")"
+[[ $(<"$rfkill_dir/pci-0000:73:00.0:wlan") == 0 ]] ||
+  fail "resume keeps the BCM4377 wlan switch unblocked"
+[[ $(<"$rfkill_dir/pci-0000:01:00.0:wlan") == 1 ]] ||
+  fail "resume leaves another adapter's saved wlan switch alone"
+[[ $(<"$sys/bus/pci/devices/0000:73:00.0/ieee80211/phy0/rfkill1/soft") == 0 ]] ||
+  fail "resume leaves the BCM4377 killswitch unblocked"
 pass "resume loads brcmfmac as soon as the Wi-Fi function is in D0"
+
+setup_sysfs
+printf '1\n' >"$rfkill_dir/pci-0000:73:00.0:wlan"
+printf '1\n' >"$sys/bus/pci/devices/0000:73:00.0/ieee80211/phy0/rfkill1/soft"
+set +e
+run_helper "$suspend" pre
+status=$?
+set -e
+assert_status 0 "$status" "pre still unloads when Wi-Fi was off"
+[[ -f $run/omarchy-t2-bcm4377-wlan-off ]] ||
+  fail "pre remembers a BCM4377 wlan soft block"
+rm -rf "$sys/module/brcmfmac" "$sys/module/hci_bcm4377"
+set +e
+run_helper "$suspend" resume
+status=$?
+set -e
+assert_status 0 "$status" "resume reloads a radio the user had turned off"
+grep -Fq $'nmcli\tradio\twifi\ton' "$calls" &&
+  fail "resume does not turn Wi-Fi on when the user had turned it off" "$(cat "$calls")"
+[[ $(<"$rfkill_dir/pci-0000:73:00.0:wlan") == 1 ]] ||
+  fail "resume keeps the saved BCM4377 wlan switch blocked"
+[[ $(<"$rfkill_dir/pci-0000:01:00.0:wlan") == 1 ]] ||
+  fail "a blocked BCM4377 resume still leaves another adapter alone"
+[[ $(<"$sys/bus/pci/devices/0000:73:00.0/ieee80211/phy0/rfkill1/soft") == 1 ]] ||
+  fail "resume leaves the BCM4377 killswitch blocked"
+pass "resume keeps Wi-Fi off when it was off before suspend"
+
+setup_sysfs
+printf 'D3hot\n' >"$sys/bus/pci/devices/0000:73:00.0/power_state"
+rm -rf "$sys/module/brcmfmac" "$sys/module/hci_bcm4377"
+set +e
+D0_TRIES=2 D0_SLEEP=0 run_helper "$suspend" resume
+status=$?
+set -e
+assert_status 1 "$status" "resume fails while the Wi-Fi function is not in D0"
+grep -Fq $'modprobe\tbrcmfmac' "$calls" &&
+  fail "resume does not probe brcmfmac before D0" "$(cat "$calls")"
+pass "resume does not probe brcmfmac while the Wi-Fi function is not in D0"
+
+setup_sysfs
+rm -rf "$sys/module/brcmfmac" "$sys/module/hci_bcm4377"
+set +e
+FAIL_LOAD=1 run_helper "$suspend" resume
+status=$?
+set -e
+assert_status 1 "$status" "resume fails when brcmfmac will not load"
+pass "a failed brcmfmac load fails the reload"
 
 setup_sysfs
 rm -rf "$sys/module/brcmfmac" "$sys/module/hci_bcm4377"
@@ -523,6 +617,27 @@ assert_status 0 "$status" "recover leaves an active reload alone"
 grep -Fq $'modprobe\tbrcmfmac' "$calls" &&
   fail "recover does not load brcmfmac while the reload unit is running" "$(cat "$calls")"
 pass "recover leaves an active reload alone"
+
+setup_sysfs
+: >"$run/omarchy-t2-bcm4377-wifi-released"
+set +e
+run_helper "$suspend" recover
+status=$?
+set -e
+assert_status 0 "$status" "recover restores a link dropped before a killed unload"
+grep -Fq $'nmcli\tdevice\tconnect\twlp115s0f0' "$calls" ||
+  fail "recover reconnects Wi-Fi when the unload never finished" "$(cat "$calls")"
+grep -Fq $'ip\tlink\tset\twlp115s0f0\tup' "$calls" ||
+  fail "recover brings the Wi-Fi interface back up" "$(cat "$calls")"
+grep -Fq $'systemctl\tstart\tbluetooth.service' "$calls" ||
+  fail "recover restarts BlueZ when a killed pre stopped it first" "$(cat "$calls")"
+grep -Fq $'modprobe\tbrcmfmac' "$calls" &&
+  fail "recover does not reload a module that is still loaded" "$(cat "$calls")"
+grep -Fq $'systemctl\tstart\t--no-block\tomarchy-t2-bcm4377-rebind.service' "$calls" &&
+  fail "recover does not rebind a Bluetooth module that never unloaded" "$(cat "$calls")"
+[[ ! -f $run/omarchy-t2-bcm4377-wifi-released ]] ||
+  fail "recover clears the dropped-link stamp"
+pass "recover restores radios when a killed pre left both modules loaded"
 
 setup_sysfs
 set +e
