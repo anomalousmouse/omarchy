@@ -215,6 +215,9 @@ printf '\n' >>"$TEST_LOG"
 if [[ ${1:-} == radio && ${2:-} == wifi && ${3:-} != on ]]; then
   printf '%s\n' "${NM_WIFI_RADIO:-enabled}"
 fi
+if [[ ${1:-} == -g && ${2:-} == GENERAL.STATE ]]; then
+  printf '%s\n' "${NM_DEVICE_STATE:-100 (connected)}"
+fi
 exit 0
 SH
 
@@ -371,6 +374,7 @@ setup_sysfs() {
   printf '0\n' >"$sys/bus/pci/devices/0000:73:00.0/ieee80211/phy0/rfkill1/hard"
   printf '0\n' >"$rfkill_dir/pci-0000:73:00.0:wlan"
   printf '1\n' >"$rfkill_dir/pci-0000:01:00.0:wlan"
+  printf '0x1003\n' >"$sys/class/net/wlp115s0f0/flags"
   printf '0x14e4\n' >"$sys/bus/pci/devices/0000:73:00.1/vendor"
   printf '0x5fa0\n' >"$sys/bus/pci/devices/0000:73:00.1/device"
   printf '0\n' >"$sys/bus/pci/devices/0000:73:00.1/bluetooth/hci1/rfkill0/soft"
@@ -403,6 +407,7 @@ run_helper() {
     export FAIL_WIFI="${FAIL_WIFI:-0}"
     export FAIL_LOAD="${FAIL_LOAD:-0}"
     export NM_WIFI_RADIO="${NM_WIFI_RADIO:-enabled}"
+    export NM_DEVICE_STATE="${NM_DEVICE_STATE:-100 (connected)}"
     export RELOAD_ACTIVE="${RELOAD_ACTIVE:-0}"
     export BCM_POWERED="${BCM_POWERED:-b true}"
     export BCM_CLASS="${BCM_CLASS:-u 7078156}"
@@ -499,7 +504,36 @@ log_before $'ip\tlink\tset\twlp115s0f0\tdown' $'ip\tlink\tset\twlp115s0f0\tup' |
   fail "a failed Wi-Fi unload brings the interface back up" "$(cat "$calls")"
 [[ ! -f $run/omarchy-t2-bcm4377-wifi-released ]] ||
   fail "a failed Wi-Fi unload clears the dropped-link stamp"
+[[ ! -e $run/omarchy-t2-bcm4377-wifi-connected ]] ||
+  fail "a failed Wi-Fi unload clears the connected-interface snapshot"
 pass "a failed brcmfmac unload restores Wi-Fi and Bluetooth and aborts suspend"
+
+setup_sysfs
+set +e
+NM_DEVICE_STATE='30 (disconnected)' FAIL_WIFI=1 run_helper "$suspend" pre
+status=$?
+set -e
+assert_status 1 "$status" "pre fails when brcmfmac stays loaded and Wi-Fi was disconnected"
+grep -Fq $'nmcli\tdevice\tdisconnect\twlp115s0f0' "$calls" ||
+  fail "a disconnected interface is still released before the unload" "$(cat "$calls")"
+grep -Fq $'nmcli\tdevice\tconnect' "$calls" &&
+  fail "a disconnected interface is not joined again after a failed unload" "$(cat "$calls")"
+log_before $'ip\tlink\tset\twlp115s0f0\tdown' $'ip\tlink\tset\twlp115s0f0\tup' ||
+  fail "a link that was up comes back up without being connected" "$(cat "$calls")"
+pass "a failed unload does not reconnect a Wi-Fi interface that was disconnected"
+
+setup_sysfs
+printf '0x1002\n' >"$sys/class/net/wlp115s0f0/flags"
+set +e
+NM_DEVICE_STATE='30 (disconnected)' FAIL_WIFI=1 run_helper "$suspend" pre
+status=$?
+set -e
+assert_status 1 "$status" "pre fails when a down, disconnected interface cannot unload"
+grep -Fq $'ip\tlink\tset\twlp115s0f0\tup' "$calls" &&
+  fail "an interface that was down stays down" "$(cat "$calls")"
+grep -Fq $'nmcli\tdevice\tconnect' "$calls" &&
+  fail "an interface that was down is not connected" "$(cat "$calls")"
+pass "a failed unload leaves a down, disconnected interface down"
 
 setup_sysfs
 printf 'x' >"$run/omarchy-t2-bcm4377-unloaded"
@@ -620,6 +654,8 @@ pass "recover leaves an active reload alone"
 
 setup_sysfs
 : >"$run/omarchy-t2-bcm4377-wifi-released"
+mkdir -p "$run/omarchy-t2-bcm4377-wifi-connected"
+: >"$run/omarchy-t2-bcm4377-wifi-connected/wlp115s0f0"
 set +e
 run_helper "$suspend" recover
 status=$?
@@ -637,7 +673,22 @@ grep -Fq $'systemctl\tstart\t--no-block\tomarchy-t2-bcm4377-rebind.service' "$ca
   fail "recover does not rebind a Bluetooth module that never unloaded" "$(cat "$calls")"
 [[ ! -f $run/omarchy-t2-bcm4377-wifi-released ]] ||
   fail "recover clears the dropped-link stamp"
+[[ ! -e $run/omarchy-t2-bcm4377-wifi-connected ]] ||
+  fail "recover clears the connected-interface snapshot"
 pass "recover restores radios when a killed pre left both modules loaded"
+
+setup_sysfs
+: >"$run/omarchy-t2-bcm4377-wifi-released"
+set +e
+run_helper "$suspend" recover
+status=$?
+set -e
+assert_status 0 "$status" "recover leaves a disconnected interface disconnected"
+grep -Fq $'nmcli\tdevice\tconnect' "$calls" &&
+  fail "recover does not join an interface that was not connected" "$(cat "$calls")"
+grep -Fq $'ip\tlink\tset\twlp115s0f0\tup' "$calls" &&
+  fail "recover does not raise an interface whose link was not up" "$(cat "$calls")"
+pass "recover does not reconnect Wi-Fi that was disconnected before the killed unload"
 
 setup_sysfs
 set +e

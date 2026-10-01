@@ -48,6 +48,7 @@ iface_tries=${OMARCHY_T2_BCM4377_IFACE_TRIES:-20}
 stamp=$run_root/omarchy-t2-bcm4377-unloaded
 wlan_off_stamp=$run_root/omarchy-t2-bcm4377-wlan-off
 released_stamp=$run_root/omarchy-t2-bcm4377-wifi-released
+connected_dir=$run_root/omarchy-t2-bcm4377-wifi-connected
 
 has_bcm4377() {
   local dev
@@ -164,9 +165,35 @@ set_bcm_wlan_soft() {
   shopt -u nullglob
 }
 
+# nmcli prints "100 (connected)" or "30 (disconnected)". The word connected
+# is inside disconnected, so the disconnected check has to come first.
+wifi_was_connected() {
+  local state
+  command -v nmcli >/dev/null 2>&1 || return 1
+  state=$(timeout 5 nmcli -g GENERAL.STATE device show "$1" 2>/dev/null || true)
+  [[ $state != *disconnected* && $state == *connected* ]]
+}
+
+# IFF_UP is the low bit of /sys/class/net/<iface>/flags.
+iface_link_up() {
+  local flags
+  [[ -r $sys_root/class/net/$1/flags ]] || return 1
+  flags=$(<"$sys_root/class/net/$1/flags")
+  (( (flags & 1) != 0 ))
+}
+
 release_wifi() {
   local iface released=0
+  rm -rf "$connected_dir"
   for iface in $(wifi_ifaces); do
+    if wifi_was_connected "$iface"; then
+      mkdir -p "$connected_dir"
+      : >"$connected_dir/$iface"
+    fi
+    if iface_link_up "$iface"; then
+      mkdir -p "$connected_dir"
+      : >"$connected_dir/$iface.up"
+    fi
     nmcli device disconnect "$iface" >/dev/null 2>&1 || true
     ip link set "$iface" down >/dev/null 2>&1 || true
     released=1
@@ -177,19 +204,25 @@ release_wifi() {
   fi
 }
 
-# Undo release_wifi when suspend did not happen. Leave a user-off radio down.
+# Undo release_wifi when suspend did not happen. Join a network again only
+# for an interface that was connected before the release. A link that was up
+# but deliberately disconnected comes back up and stays disconnected. A
+# user-off radio stays down.
 restore_wifi() {
   local iface
   [[ -f $released_stamp ]] || return 0
   if [[ ! -f $wlan_off_stamp ]]; then
     for iface in $(wifi_ifaces); do
-      ip link set "$iface" up >/dev/null 2>&1 || true
-      if command -v nmcli >/dev/null 2>&1; then
+      if [[ -e $connected_dir/$iface.up || -e $connected_dir/$iface ]]; then
+        ip link set "$iface" up >/dev/null 2>&1 || true
+      fi
+      if [[ -e $connected_dir/$iface ]] && command -v nmcli >/dev/null 2>&1; then
         nmcli device connect "$iface" >/dev/null 2>&1 || true
       fi
     done
   fi
   rm -f "$released_stamp"
+  rm -rf "$connected_dir"
 }
 
 # Stop Bluetooth, then the module. A busy hci_bcm4377 is a failed pre: the
@@ -351,6 +384,7 @@ pre() {
   release_wifi
   if unload_wifi; then
     rm -f "$released_stamp"
+    rm -rf "$connected_dir"
     mark_unloaded
     exit 0
   fi
@@ -400,6 +434,7 @@ recover() {
 
   if [[ -f $stamp ]] || ! loaded brcmfmac || ! loaded hci_bcm4377; then
     rm -f "$stamp" "$released_stamp"
+    rm -rf "$connected_dir"
     resume
     return
   fi
