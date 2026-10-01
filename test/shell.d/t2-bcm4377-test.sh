@@ -216,7 +216,12 @@ if [[ ${1:-} == radio && ${2:-} == wifi && ${3:-} != on ]]; then
   printf '%s\n' "${NM_WIFI_RADIO:-enabled}"
 fi
 if [[ ${1:-} == -g && ${2:-} == GENERAL.STATE ]]; then
-  printf '%s\n' "${NM_DEVICE_STATE:-100 (connected)}"
+  if [[ ${NM_DEVICE_STATE:-100 (connected)} != missing ]]; then
+    printf '%s\n' "${NM_DEVICE_STATE:-100 (connected)}"
+  fi
+fi
+if [[ ${1:-} == device && ${2:-} == disconnect && ${NM_DISCONNECT_FAIL:-0} == 1 ]]; then
+  exit 1
 fi
 exit 0
 SH
@@ -408,6 +413,7 @@ run_helper() {
     export FAIL_LOAD="${FAIL_LOAD:-0}"
     export NM_WIFI_RADIO="${NM_WIFI_RADIO:-enabled}"
     export NM_DEVICE_STATE="${NM_DEVICE_STATE:-100 (connected)}"
+    export NM_DISCONNECT_FAIL="${NM_DISCONNECT_FAIL:-0}"
     export RELOAD_ACTIVE="${RELOAD_ACTIVE:-0}"
     export BCM_POWERED="${BCM_POWERED:-b true}"
     export BCM_CLASS="${BCM_CLASS:-u 7078156}"
@@ -534,6 +540,36 @@ grep -Fq $'ip\tlink\tset\twlp115s0f0\tup' "$calls" &&
 grep -Fq $'nmcli\tdevice\tconnect' "$calls" &&
   fail "an interface that was down is not connected" "$(cat "$calls")"
 pass "a failed unload leaves a down, disconnected interface down"
+
+setup_sysfs
+set +e
+NM_DEVICE_STATE='70 (connecting (getting IP configuration))' FAIL_WIFI=1 run_helper "$suspend" pre
+status=$?
+set -e
+assert_status 1 "$status" "pre fails while Wi-Fi is still obtaining an address"
+log_before $'nmcli\tdevice\tdisconnect\twlp115s0f0' $'nmcli\tdevice\tconnect\twlp115s0f0' ||
+  fail "a connection that was still coming up is joined again" "$(cat "$calls")"
+pass "a failed unload resumes Wi-Fi that was still connecting"
+
+setup_sysfs
+set +e
+NM_DEVICE_STATE=missing FAIL_WIFI=1 run_helper "$suspend" pre
+status=$?
+set -e
+assert_status 1 "$status" "pre fails when the Wi-Fi state lookup returns nothing"
+grep -Fq $'nmcli\tdevice\tconnect\twlp115s0f0' "$calls" ||
+  fail "a successful disconnect after a failed lookup is joined again" "$(cat "$calls")"
+pass "a failed state lookup still rejoins when disconnect found an active device"
+
+setup_sysfs
+set +e
+NM_DEVICE_STATE=missing NM_DISCONNECT_FAIL=1 FAIL_WIFI=1 run_helper "$suspend" pre
+status=$?
+set -e
+assert_status 1 "$status" "pre fails when neither the lookup nor the disconnect sees a connection"
+grep -Fq $'nmcli\tdevice\tconnect' "$calls" &&
+  fail "nothing is joined when the lookup failed and no connection was active" "$(cat "$calls")"
+pass "a failed state lookup does not rejoin when nothing was active"
 
 setup_sysfs
 printf 'x' >"$run/omarchy-t2-bcm4377-unloaded"

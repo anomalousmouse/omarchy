@@ -165,13 +165,16 @@ set_bcm_wlan_soft() {
   shopt -u nullglob
 }
 
-# nmcli prints "100 (connected)" or "30 (disconnected)". The word connected
-# is inside disconnected, so the disconnected check has to come first.
-wifi_was_connected() {
-  local state
-  command -v nmcli >/dev/null 2>&1 || return 1
-  state=$(timeout 5 nmcli -g GENERAL.STATE device show "$1" 2>/dev/null || true)
-  [[ $state != *disconnected* && $state == *connected* ]]
+# nmcli prints "100 (connected)", "70 (connecting (getting IP configuration))",
+# or "30 (disconnected)". "connected" is a substring of "disconnected", so
+# that check comes first. A link that is still associating or waiting for
+# DHCP is in progress and should be joined again. deactivating is the user
+# hanging up, so it is left alone.
+wifi_should_rejoin() {
+  local state=$1
+  [[ -z $state ]] && return 1
+  [[ $state == *disconnected* || $state == *deactivating* || $state == *unavailable* || $state == *unmanaged* || $state == *failed* ]] && return 1
+  [[ $state == *connected* || $state == *connecting* ]]
 }
 
 # IFF_UP is the low bit of /sys/class/net/<iface>/flags.
@@ -183,18 +186,35 @@ iface_link_up() {
 }
 
 release_wifi() {
-  local iface released=0
+  local iface released=0 state rejoin unknown
   rm -rf "$connected_dir"
   for iface in $(wifi_ifaces); do
-    if wifi_was_connected "$iface"; then
-      mkdir -p "$connected_dir"
-      : >"$connected_dir/$iface"
+    rejoin=0
+    unknown=0
+    state=""
+    if command -v nmcli >/dev/null 2>&1; then
+      state=$(timeout 5 nmcli -g GENERAL.STATE device show "$iface" 2>/dev/null || true)
+    fi
+    if [[ -z $state ]]; then
+      unknown=1
+    elif wifi_should_rejoin "$state"; then
+      rejoin=1
     fi
     if iface_link_up "$iface"; then
       mkdir -p "$connected_dir"
       : >"$connected_dir/$iface.up"
     fi
-    nmcli device disconnect "$iface" >/dev/null 2>&1 || true
+    # A failed lookup learns from the disconnect itself. Success means
+    # NetworkManager still had a connection in progress or up.
+    if nmcli device disconnect "$iface" >/dev/null 2>&1; then
+      if ((unknown)); then
+        rejoin=1
+      fi
+    fi
+    if ((rejoin)); then
+      mkdir -p "$connected_dir"
+      : >"$connected_dir/$iface"
+    fi
     ip link set "$iface" down >/dev/null 2>&1 || true
     released=1
   done
@@ -204,9 +224,9 @@ release_wifi() {
   fi
 }
 
-# Undo release_wifi when suspend did not happen. Join a network again only
-# for an interface that was connected before the release. A link that was up
-# but deliberately disconnected comes back up and stays disconnected. A
+# Undo release_wifi when suspend did not happen. Join again when the
+# interface was connected or still connecting. A link that was up but
+# deliberately disconnected comes back up and stays disconnected. A
 # user-off radio stays down.
 restore_wifi() {
   local iface
