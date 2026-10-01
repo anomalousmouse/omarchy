@@ -186,31 +186,25 @@ iface_link_up() {
 }
 
 release_wifi() {
-  local iface released=0 state rejoin unknown
+  local iface released=0 state rejoin
   rm -rf "$connected_dir"
   for iface in $(wifi_ifaces); do
     rejoin=0
-    unknown=0
     state=""
     if command -v nmcli >/dev/null 2>&1; then
       state=$(timeout 5 nmcli -g GENERAL.STATE device show "$iface" 2>/dev/null || true)
     fi
-    if [[ -z $state ]]; then
-      unknown=1
-    elif wifi_should_rejoin "$state"; then
+    # Only a state we actually read can justify joining again. nmcli device
+    # disconnect also returns success for an interface that was already
+    # disconnected, so its exit status is not evidence of an active link.
+    if wifi_should_rejoin "$state"; then
       rejoin=1
     fi
     if iface_link_up "$iface"; then
       mkdir -p "$connected_dir"
       : >"$connected_dir/$iface.up"
     fi
-    # A failed lookup learns from the disconnect itself. Success means
-    # NetworkManager still had a connection in progress or up.
-    if nmcli device disconnect "$iface" >/dev/null 2>&1; then
-      if ((unknown)); then
-        rejoin=1
-      fi
-    fi
+    nmcli device disconnect "$iface" >/dev/null 2>&1 || true
     if ((rejoin)); then
       mkdir -p "$connected_dir"
       : >"$connected_dir/$iface"
@@ -224,10 +218,10 @@ release_wifi() {
   fi
 }
 
-# Undo release_wifi when suspend did not happen. Join again when the
-# interface was connected or still connecting. A link that was up but
-# deliberately disconnected comes back up and stays disconnected. A
-# user-off radio stays down.
+# Undo release_wifi when suspend did not happen. Join again only when the
+# recorded state was connected or still connecting. A missed lookup does
+# not join. A link that was up but deliberately disconnected comes back up
+# and stays disconnected. A user-off radio stays down.
 restore_wifi() {
   local iface
   [[ -f $released_stamp ]] || return 0

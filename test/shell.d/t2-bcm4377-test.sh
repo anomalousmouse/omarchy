@@ -220,9 +220,6 @@ if [[ ${1:-} == -g && ${2:-} == GENERAL.STATE ]]; then
     printf '%s\n' "${NM_DEVICE_STATE:-100 (connected)}"
   fi
 fi
-if [[ ${1:-} == device && ${2:-} == disconnect && ${NM_DISCONNECT_FAIL:-0} == 1 ]]; then
-  exit 1
-fi
 exit 0
 SH
 
@@ -413,7 +410,6 @@ run_helper() {
     export FAIL_LOAD="${FAIL_LOAD:-0}"
     export NM_WIFI_RADIO="${NM_WIFI_RADIO:-enabled}"
     export NM_DEVICE_STATE="${NM_DEVICE_STATE:-100 (connected)}"
-    export NM_DISCONNECT_FAIL="${NM_DISCONNECT_FAIL:-0}"
     export RELOAD_ACTIVE="${RELOAD_ACTIVE:-0}"
     export BCM_POWERED="${BCM_POWERED:-b true}"
     export BCM_CLASS="${BCM_CLASS:-u 7078156}"
@@ -557,19 +553,13 @@ NM_DEVICE_STATE=missing FAIL_WIFI=1 run_helper "$suspend" pre
 status=$?
 set -e
 assert_status 1 "$status" "pre fails when the Wi-Fi state lookup returns nothing"
-grep -Fq $'nmcli\tdevice\tconnect\twlp115s0f0' "$calls" ||
-  fail "a successful disconnect after a failed lookup is joined again" "$(cat "$calls")"
-pass "a failed state lookup still rejoins when disconnect found an active device"
-
-setup_sysfs
-set +e
-NM_DEVICE_STATE=missing NM_DISCONNECT_FAIL=1 FAIL_WIFI=1 run_helper "$suspend" pre
-status=$?
-set -e
-assert_status 1 "$status" "pre fails when neither the lookup nor the disconnect sees a connection"
+grep -Fq $'nmcli\tdevice\tdisconnect\twlp115s0f0' "$calls" ||
+  fail "the interface is still released when its state could not be read" "$(cat "$calls")"
 grep -Fq $'nmcli\tdevice\tconnect' "$calls" &&
-  fail "nothing is joined when the lookup failed and no connection was active" "$(cat "$calls")"
-pass "a failed state lookup does not rejoin when nothing was active"
+  fail "a successful disconnect does not rejoin an interface whose state was not read" "$(cat "$calls")"
+log_before $'ip\tlink\tset\twlp115s0f0\tdown' $'ip\tlink\tset\twlp115s0f0\tup' ||
+  fail "a link that was up still comes back up" "$(cat "$calls")"
+pass "a failed state lookup does not rejoin Wi-Fi after a successful disconnect"
 
 setup_sysfs
 printf 'x' >"$run/omarchy-t2-bcm4377-unloaded"
