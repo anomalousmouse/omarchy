@@ -23,6 +23,8 @@ rfkill_state=${OMARCHY_T2_BCM4377_RFKILL_STATE:-/var/lib/systemd/rfkill}
 unbind_sleep=${OMARCHY_T2_BCM4377_UNBIND_SLEEP:-2}
 bind_sleep=${OMARCHY_T2_BCM4377_BIND_SLEEP:-3}
 bluez_sleep=${OMARCHY_T2_BCM4377_BLUEZ_SLEEP:-3}
+settle_sleep=${OMARCHY_T2_BCM4377_SETTLE_SLEEP:-0.5}
+settle_tries=${OMARCHY_T2_BCM4377_SETTLE_TRIES:-10}
 drv=$sys_root/bus/pci/drivers/hci_bcm4377
 
 DEV=""
@@ -113,10 +115,19 @@ if adapter_rfkill_blocked || persisted_bluetooth_blocked; then
   exit 0
 fi
 
-if alive; then
-  echo "omarchy-t2-bcm4377-rebind: $DEV already usable, nothing to do"
-  exit 0
-fi
+# After a resume, this unit starts right after modprobe, before BlueZ has
+# powered the new controller. Checking once reads a healthy adapter as hung,
+# and the unbind that follows waits out ring teardown timeouts. Give BlueZ a
+# few seconds first.
+for i in $(seq 1 "$settle_tries"); do
+  if alive; then
+    echo "omarchy-t2-bcm4377-rebind: $DEV already usable, nothing to do"
+    exit 0
+  fi
+  if ((i < settle_tries)); then
+    sleep "$settle_sleep"
+  fi
+done
 
 for i in $(seq 1 "$MAX_TRIES"); do
   echo "omarchy-t2-bcm4377-rebind: attempt $i/$MAX_TRIES on $DEV"

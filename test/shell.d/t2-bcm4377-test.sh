@@ -404,6 +404,8 @@ run_helper() {
     export OMARCHY_T2_BCM4377_UNBIND_SLEEP=0
     export OMARCHY_T2_BCM4377_BIND_SLEEP=0
     export OMARCHY_T2_BCM4377_BLUEZ_SLEEP=0
+    export OMARCHY_T2_BCM4377_SETTLE_SLEEP=0
+    export OMARCHY_T2_BCM4377_SETTLE_TRIES="${SETTLE_TRIES:-1}"
     export MAX_TRIES="${MAX_TRIES:-5}"
     export FAIL_HCI="${FAIL_HCI:-0}"
     export FAIL_WIFI="${FAIL_WIFI:-0}"
@@ -755,6 +757,16 @@ assert_status 0 "$status" "a persisted soft block exits cleanly"
 grep -Fq 'busctl' "$calls" &&
   fail "a persisted soft block does not power the adapter on" "$(cat "$calls")"
 pass "a persisted rfkill block for the BCM4377 function is left off"
+
+setup_sysfs
+set +e
+BCM_CLASS_MODE=flip BCM_CLASS='u 0' SETTLE_TRIES=3 run_helper "$rebind"
+status=$?
+set -e
+assert_status 0 "$status" "a controller BlueZ powers while settling is usable"
+[[ ! -s $sys/bus/pci/drivers/hci_bcm4377/unbind ]] ||
+  fail "a controller that comes up while settling is not unbound" "$(cat "$calls")"
+pass "a controller that comes up while BlueZ settles is not rebound"
 
 setup_sysfs
 set +e
