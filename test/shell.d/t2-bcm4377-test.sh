@@ -173,6 +173,10 @@ SH
 cat >"$helper_bin/busctl" <<'SH'
 #!/bin/bash
 
+if [[ ${BCM_BUSCTL_SLEEP:-0} != 0 ]]; then
+  sleep "$BCM_BUSCTL_SLEEP"
+fi
+
 printf 'busctl' >>"$TEST_LOG"
 printf '\t%s' "$@" >>"$TEST_LOG"
 printf '\n' >>"$TEST_LOG"
@@ -406,6 +410,9 @@ run_helper() {
     export OMARCHY_T2_BCM4377_BLUEZ_SLEEP=0
     export OMARCHY_T2_BCM4377_SETTLE_SLEEP=0
     export OMARCHY_T2_BCM4377_SETTLE_TRIES="${SETTLE_TRIES:-1}"
+    export OMARCHY_T2_BCM4377_SETTLE_BUDGET="${SETTLE_BUDGET:-5}"
+    export OMARCHY_T2_BCM4377_BUS_TIMEOUT="${BUS_TIMEOUT:-5}"
+    export BCM_BUSCTL_SLEEP="${BCM_BUSCTL_SLEEP:-0}"
     export MAX_TRIES="${MAX_TRIES:-5}"
     export FAIL_HCI="${FAIL_HCI:-0}"
     export FAIL_WIFI="${FAIL_WIFI:-0}"
@@ -771,6 +778,22 @@ power_sets=$(grep -c 'set-property' "$calls" || true)
 [[ $power_sets -eq 1 ]] ||
   fail "settle powers the adapter once" "$(cat "$calls")"
 pass "a controller that comes up while BlueZ settles is not rebound"
+
+setup_sysfs
+set +e
+settle_started=$SECONDS
+BCM_BUSCTL_SLEEP=30 SETTLE_BUDGET=1 SETTLE_TRIES=10 BUS_TIMEOUT=1 MAX_TRIES=1 \
+  run_helper "$rebind"
+status=$?
+settle_elapsed=$((SECONDS - settle_started))
+set -e
+assert_status 1 "$status" "a stalled BlueZ settle still finishes the rebind attempt"
+grep -qx '0000:73:00.1' "$sys/bus/pci/drivers/hci_bcm4377/unbind" ||
+  fail "a stalled settle still rebinds the BCM4377 function" \
+    "$(cat "$sys/bus/pci/drivers/hci_bcm4377/unbind")"
+((settle_elapsed < 8)) ||
+  fail "a stalled settle does not use the rebind timeout" "${settle_elapsed}s"
+pass "a stalled BlueZ property read does not exhaust the rebind timeout"
 
 setup_sysfs
 set +e

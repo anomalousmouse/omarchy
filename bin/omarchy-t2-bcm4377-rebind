@@ -25,6 +25,11 @@ bind_sleep=${OMARCHY_T2_BCM4377_BIND_SLEEP:-3}
 bluez_sleep=${OMARCHY_T2_BCM4377_BLUEZ_SLEEP:-3}
 settle_sleep=${OMARCHY_T2_BCM4377_SETTLE_SLEEP:-0.5}
 settle_tries=${OMARCHY_T2_BCM4377_SETTLE_TRIES:-10}
+# The rebind unit's start timeout has to cover the unbind loop. This wait
+# shares one budget, so a stalled property read cannot use that timeout up.
+settle_budget=${OMARCHY_T2_BCM4377_SETTLE_BUDGET:-5}
+bus_timeout=${OMARCHY_T2_BCM4377_BUS_TIMEOUT:-5}
+settle_deadline=
 drv=$sys_root/bus/pci/drivers/hci_bcm4377
 
 DEV=""
@@ -93,12 +98,25 @@ bcm_hci_name() {
 # `show <mac>` prints the record and then does not exit.
 # This does not ask BlueZ to power the adapter. The settle path below powers
 # it once. The rebind loop asks again only after an unbind.
+# During the settle wait, each call gets only the time still left in the
+# shared budget. After that, calls use bus_timeout.
+run_busctl() {
+  local limit=$bus_timeout
+  if [[ -n $settle_deadline ]]; then
+    limit=$((settle_deadline - SECONDS))
+    if ((limit <= 0)); then
+      return 1
+    fi
+  fi
+  timeout "$limit" busctl "$@"
+}
+
 controller_usable() {
   local hci powered class
   hci=$(bcm_hci_name) || return 1
-  powered=$(timeout 5 busctl get-property org.bluez "/org/bluez/$hci" org.bluez.Adapter1 Powered 2>/dev/null) || return 1
+  powered=$(run_busctl get-property org.bluez "/org/bluez/$hci" org.bluez.Adapter1 Powered 2>/dev/null) || return 1
   [[ $powered == "b true" ]] || return 1
-  class=$(timeout 5 busctl get-property org.bluez "/org/bluez/$hci" org.bluez.Adapter1 Class 2>/dev/null) || return 1
+  class=$(run_busctl get-property org.bluez "/org/bluez/$hci" org.bluez.Adapter1 Class 2>/dev/null) || return 1
   # bluetoothctl prints this as "Class: 0x00000000". Powered can already be true.
   [[ $class == "u 0" ]] && return 1
   return 0
@@ -107,7 +125,7 @@ controller_usable() {
 alive() {
   local hci
   hci=$(bcm_hci_name) || return 1
-  timeout 5 busctl set-property org.bluez "/org/bluez/$hci" org.bluez.Adapter1 Powered b true >/dev/null 2>&1 || true
+  run_busctl set-property org.bluez "/org/bluez/$hci" org.bluez.Adapter1 Powered b true >/dev/null 2>&1 || true
   controller_usable
 }
 
@@ -116,24 +134,33 @@ alive() {
 # still in flight. Wait for the adapter object, power it once, and let its
 # class leave 0. A class that stays 0 is the hang the rebind loop handles.
 settle_controller() {
-  local i hci powered_once=0
+  local i hci powered_once=0 status=1
+  settle_deadline=$((SECONDS + settle_budget))
   for i in $(seq 1 "$settle_tries"); do
-    if controller_usable; then
-      return 0
+    if ((SECONDS >= settle_deadline)); then
+      break
     fi
-    if ((powered_once == 0)); then
+    if controller_usable; then
+      status=0
+      break
+    fi
+    if ((powered_once == 0)) && ((SECONDS < settle_deadline)); then
       hci=$(bcm_hci_name) || hci=""
-      if [[ -n $hci ]] && timeout 5 busctl get-property org.bluez "/org/bluez/$hci" org.bluez.Adapter1 Powered >/dev/null 2>&1; then
-        timeout 5 busctl set-property org.bluez "/org/bluez/$hci" org.bluez.Adapter1 Powered b true >/dev/null 2>&1 || true
+      if [[ -n $hci ]] && run_busctl get-property org.bluez "/org/bluez/$hci" org.bluez.Adapter1 Powered >/dev/null 2>&1; then
+        run_busctl set-property org.bluez "/org/bluez/$hci" org.bluez.Adapter1 Powered b true >/dev/null 2>&1 || true
         powered_once=1
-        controller_usable && return 0
+        if controller_usable; then
+          status=0
+          break
+        fi
       fi
     fi
-    if ((i < settle_tries)); then
-      sleep "$settle_sleep"
+    if ((i < settle_tries)) && ((SECONDS < settle_deadline)); then
+      timeout "$((settle_deadline - SECONDS))" sleep "$settle_sleep" || true
     fi
   done
-  return 1
+  settle_deadline=
+  return "$status"
 }
 
 if persisted_bluetooth_blocked; then
