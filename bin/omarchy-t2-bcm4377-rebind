@@ -91,16 +91,49 @@ bcm_hci_name() {
 # is not the adapter under test. bluetoothctl is the wrong tool here: `show`
 # with no argument is the default controller, `show hci0` is rejected, and
 # `show <mac>` prints the record and then does not exit.
-alive() {
+# This does not ask BlueZ to power the adapter. The settle path below powers
+# it once. The rebind loop asks again only after an unbind.
+controller_usable() {
   local hci powered class
   hci=$(bcm_hci_name) || return 1
-  timeout 5 busctl set-property org.bluez "/org/bluez/$hci" org.bluez.Adapter1 Powered b true >/dev/null 2>&1 || true
   powered=$(timeout 5 busctl get-property org.bluez "/org/bluez/$hci" org.bluez.Adapter1 Powered 2>/dev/null) || return 1
   [[ $powered == "b true" ]] || return 1
   class=$(timeout 5 busctl get-property org.bluez "/org/bluez/$hci" org.bluez.Adapter1 Class 2>/dev/null) || return 1
   # bluetoothctl prints this as "Class: 0x00000000". Powered can already be true.
   [[ $class == "u 0" ]] && return 1
   return 0
+}
+
+alive() {
+  local hci
+  hci=$(bcm_hci_name) || return 1
+  timeout 5 busctl set-property org.bluez "/org/bluez/$hci" org.bluez.Adapter1 Powered b true >/dev/null 2>&1 || true
+  controller_usable
+}
+
+# After resume this unit starts as soon as the driver is loaded, before BlueZ
+# has exported the controller. Unbinding then cancels init commands that are
+# still in flight. Wait for the adapter object, power it once, and let its
+# class leave 0. A class that stays 0 is the hang the rebind loop handles.
+settle_controller() {
+  local i hci powered_once=0
+  for i in $(seq 1 "$settle_tries"); do
+    if controller_usable; then
+      return 0
+    fi
+    if ((powered_once == 0)); then
+      hci=$(bcm_hci_name) || hci=""
+      if [[ -n $hci ]] && timeout 5 busctl get-property org.bluez "/org/bluez/$hci" org.bluez.Adapter1 Powered >/dev/null 2>&1; then
+        timeout 5 busctl set-property org.bluez "/org/bluez/$hci" org.bluez.Adapter1 Powered b true >/dev/null 2>&1 || true
+        powered_once=1
+        controller_usable && return 0
+      fi
+    fi
+    if ((i < settle_tries)); then
+      sleep "$settle_sleep"
+    fi
+  done
+  return 1
 }
 
 if persisted_bluetooth_blocked; then
@@ -115,19 +148,12 @@ if adapter_rfkill_blocked || persisted_bluetooth_blocked; then
   exit 0
 fi
 
-# After a resume, this unit starts right after modprobe, before BlueZ has
-# powered the new controller. Checking once reads a healthy adapter as hung,
-# and the unbind that follows waits out ring teardown timeouts. Give BlueZ a
-# few seconds first.
-for i in $(seq 1 "$settle_tries"); do
-  if alive; then
-    echo "omarchy-t2-bcm4377-rebind: $DEV already usable, nothing to do"
-    exit 0
-  fi
-  if ((i < settle_tries)); then
-    sleep "$settle_sleep"
-  fi
-done
+if settle_controller; then
+  echo "omarchy-t2-bcm4377-rebind: $DEV already usable, nothing to do"
+  exit 0
+fi
+
+echo "omarchy-t2-bcm4377-rebind: $DEV still not usable, rebinding"
 
 for i in $(seq 1 "$MAX_TRIES"); do
   echo "omarchy-t2-bcm4377-rebind: attempt $i/$MAX_TRIES on $DEV"

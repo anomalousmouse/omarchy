@@ -196,7 +196,7 @@ fi
 if [[ $* == *hci1* && $* == *Class* ]]; then
   echo x >>"${SHOW_COUNT:?}"
   n=$(wc -l <"$SHOW_COUNT")
-  if [[ ${BCM_CLASS_MODE:-static} == flip && $n -ge 2 ]]; then
+  if [[ ${BCM_CLASS_MODE:-static} == flip && $n -ge ${BCM_CLASS_FLIP_AT:-2} ]]; then
     printf 'u 7078156\n'
   else
     printf '%s\n' "${BCM_CLASS:-u 7078156}"
@@ -416,6 +416,7 @@ run_helper() {
     export BCM_POWERED="${BCM_POWERED:-b true}"
     export BCM_CLASS="${BCM_CLASS:-u 7078156}"
     export BCM_CLASS_MODE="${BCM_CLASS_MODE:-static}"
+    export BCM_CLASS_FLIP_AT="${BCM_CLASS_FLIP_AT:-2}"
     : >"$calls"
     : >"$show_count"
     bash "$script" "$@" >/dev/null 2>&1
@@ -766,11 +767,14 @@ set -e
 assert_status 0 "$status" "a controller BlueZ powers while settling is usable"
 [[ ! -s $sys/bus/pci/drivers/hci_bcm4377/unbind ]] ||
   fail "a controller that comes up while settling is not unbound" "$(cat "$calls")"
+power_sets=$(grep -c 'set-property' "$calls" || true)
+[[ $power_sets -eq 1 ]] ||
+  fail "settle powers the adapter once" "$(cat "$calls")"
 pass "a controller that comes up while BlueZ settles is not rebound"
 
 setup_sysfs
 set +e
-BCM_CLASS_MODE=flip BCM_CLASS='u 0' MAX_TRIES=1 run_helper "$rebind"
+BCM_CLASS_MODE=flip BCM_CLASS='u 0' BCM_CLASS_FLIP_AT=3 MAX_TRIES=1 run_helper "$rebind"
 status=$?
 set -e
 assert_status 0 "$status" "an unset class is rebound until the BCM4377 controller answers"
