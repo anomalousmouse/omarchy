@@ -410,7 +410,9 @@ run_helper() {
     export OMARCHY_T2_BCM4377_BLUEZ_SLEEP=0
     export OMARCHY_T2_BCM4377_SETTLE_SLEEP=0
     export OMARCHY_T2_BCM4377_SETTLE_TRIES="${SETTLE_TRIES:-1}"
-    export OMARCHY_T2_BCM4377_SETTLE_BUDGET="${SETTLE_BUDGET:-5}"
+    export OMARCHY_T2_BCM4377_SETTLE_BUDGET="${SETTLE_BUDGET:-15}"
+    export OMARCHY_T2_BCM4377_SETTLE_CALL_TIMEOUT="${SETTLE_CALL_TIMEOUT:-1}"
+    export OMARCHY_T2_BCM4377_SETTLE_STALL_LIMIT="${SETTLE_STALL_LIMIT:-2}"
     export OMARCHY_T2_BCM4377_BUS_TIMEOUT="${BUS_TIMEOUT:-5}"
     export BCM_BUSCTL_SLEEP="${BCM_BUSCTL_SLEEP:-0}"
     export MAX_TRIES="${MAX_TRIES:-5}"
@@ -781,8 +783,19 @@ pass "a controller that comes up while BlueZ settles is not rebound"
 
 setup_sysfs
 set +e
+BCM_CLASS_MODE=flip BCM_CLASS='u 0' BCM_CLASS_FLIP_AT=12 SETTLE_TRIES=30 \
+  SETTLE_BUDGET=15 run_helper "$rebind"
+status=$?
+set -e
+assert_status 0 "$status" "a slow BlueZ init is usable before the settle budget"
+[[ ! -s $sys/bus/pci/drivers/hci_bcm4377/unbind ]] ||
+  fail "a controller that answers late is not unbound" "$(cat "$calls")"
+pass "a controller that becomes usable after several settle checks is not rebound"
+
+setup_sysfs
+set +e
 settle_started=$SECONDS
-BCM_BUSCTL_SLEEP=30 SETTLE_BUDGET=1 SETTLE_TRIES=10 BUS_TIMEOUT=1 MAX_TRIES=1 \
+BCM_BUSCTL_SLEEP=30 SETTLE_BUDGET=15 SETTLE_TRIES=30 BUS_TIMEOUT=1 MAX_TRIES=1 \
   run_helper "$rebind"
 status=$?
 settle_elapsed=$((SECONDS - settle_started))
