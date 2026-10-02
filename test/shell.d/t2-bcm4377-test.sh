@@ -408,9 +408,11 @@ run_helper() {
     export OMARCHY_T2_BCM4377_UNBIND_SLEEP=0
     export OMARCHY_T2_BCM4377_BIND_SLEEP=0
     export OMARCHY_T2_BCM4377_BLUEZ_SLEEP=0
-    export OMARCHY_T2_BCM4377_SETTLE_SLEEP=0
+    export OMARCHY_T2_BCM4377_SETTLE_SLEEP="${SETTLE_SLEEP:-0}"
     export OMARCHY_T2_BCM4377_SETTLE_TRIES="${SETTLE_TRIES:-1}"
-    export OMARCHY_T2_BCM4377_SETTLE_BUDGET="${SETTLE_BUDGET:-15}"
+    if [[ -n ${SETTLE_BUDGET:-} ]]; then
+      export OMARCHY_T2_BCM4377_SETTLE_BUDGET="$SETTLE_BUDGET"
+    fi
     export OMARCHY_T2_BCM4377_SETTLE_CALL_TIMEOUT="${SETTLE_CALL_TIMEOUT:-1}"
     export OMARCHY_T2_BCM4377_SETTLE_STALL_LIMIT="${SETTLE_STALL_LIMIT:-2}"
     export OMARCHY_T2_BCM4377_BUS_TIMEOUT="${BUS_TIMEOUT:-5}"
@@ -783,14 +785,20 @@ pass "a controller that comes up while BlueZ settles is not rebound"
 
 setup_sysfs
 set +e
-BCM_CLASS_MODE=flip BCM_CLASS='u 0' BCM_CLASS_FLIP_AT=12 SETTLE_TRIES=30 \
-  SETTLE_BUDGET=15 run_helper "$rebind"
+slow_started=$SECONDS
+# The class flips on the read after one 6s pause, using the script's own
+# settle budget. Sleep 0 would finish inside the old 5s deadline.
+BCM_CLASS_MODE=flip BCM_CLASS='u 0' BCM_CLASS_FLIP_AT=3 SETTLE_TRIES=4 \
+  SETTLE_SLEEP=6 run_helper "$rebind"
 status=$?
+slow_elapsed=$((SECONDS - slow_started))
 set -e
-assert_status 0 "$status" "a slow BlueZ init is usable before the settle budget"
+assert_status 0 "$status" "a controller that answers after five seconds is usable"
 [[ ! -s $sys/bus/pci/drivers/hci_bcm4377/unbind ]] ||
-  fail "a controller that answers late is not unbound" "$(cat "$calls")"
-pass "a controller that becomes usable after several settle checks is not rebound"
+  fail "a controller that answers after five seconds is not unbound" "$(cat "$calls")"
+((slow_elapsed >= 6)) ||
+  fail "the slow init waits past the old five second deadline" "${slow_elapsed}s"
+pass "a controller that becomes usable after five seconds is not rebound"
 
 setup_sysfs
 set +e
