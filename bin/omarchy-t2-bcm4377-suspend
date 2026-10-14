@@ -436,9 +436,9 @@ resume() {
 }
 
 # Backstop when pre, post, or the reload is killed or fails. A reload that
-# is already running owns the bring-up. Missing modules take the normal D0
-# resume. Modules that never left can still be missing BlueZ or the link,
-# which is a killed pre that stopped after release and before the unload.
+# is already running owns the bring-up. A missing brcmfmac takes the normal
+# D0 resume. A brcmfmac that never left still has the link pre dropped, and
+# Bluetooth may already be unloaded: pre does Bluetooth first.
 recover() {
   has_bcm4377 || exit 0
 
@@ -446,17 +446,15 @@ recover() {
     exit 0
   fi
 
-  if [[ -f $stamp ]] || ! loaded brcmfmac || ! loaded hci_bcm4377; then
+  if [[ -f $stamp ]] || ! loaded brcmfmac; then
     rm -f "$stamp" "$released_stamp"
     rm -rf "$connected_dir"
     resume
     return
   fi
 
-  if ! systemctl is-active --quiet bluetooth.service; then
-    systemctl start bluetooth.service >/dev/null 2>&1 || true
-  fi
   restore_wifi
+  restore_bluetooth
 }
 
 case "${1:-}" in

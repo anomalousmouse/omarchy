@@ -731,6 +731,28 @@ grep -Fq $'ip\tlink\tset\twlp115s0f0\tup' "$calls" &&
 pass "recover does not reconnect Wi-Fi that was disconnected before the killed unload"
 
 setup_sysfs
+rm -rf "$sys/module/hci_bcm4377"
+: >"$run/omarchy-t2-bcm4377-wifi-released"
+mkdir -p "$run/omarchy-t2-bcm4377-wifi-connected"
+: >"$run/omarchy-t2-bcm4377-wifi-connected/wlp115s0f0"
+set +e
+run_helper "$suspend" recover
+status=$?
+set -e
+assert_status 0 "$status" "recover restores a pre killed between the two unloads"
+grep -Fq $'nmcli\tdevice\tconnect\twlp115s0f0' "$calls" ||
+  fail "recover reconnects Wi-Fi when only Bluetooth had unloaded" "$(cat "$calls")"
+grep -Fq $'ip\tlink\tset\twlp115s0f0\tup' "$calls" ||
+  fail "recover brings the Wi-Fi link back up when only Bluetooth had unloaded" "$(cat "$calls")"
+grep -Fq $'modprobe\thci_bcm4377' "$calls" ||
+  fail "recover loads Bluetooth again when only Bluetooth had unloaded" "$(cat "$calls")"
+grep -Fq $'systemctl\tstart\t--no-block\tomarchy-t2-bcm4377-rebind.service' "$calls" ||
+  fail "recover rebinds the Bluetooth module it loaded again" "$(cat "$calls")"
+grep -Fq $'modprobe\tbrcmfmac' "$calls" &&
+  fail "recover does not reload a brcmfmac that never unloaded" "$(cat "$calls")"
+pass "recover restores Wi-Fi and Bluetooth when pre was killed between the two unloads"
+
+setup_sysfs
 set +e
 run_helper "$rebind"
 status=$?
