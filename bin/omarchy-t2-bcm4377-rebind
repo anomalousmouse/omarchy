@@ -210,11 +210,8 @@ settle_controller() {
   return "$status"
 }
 
-if persisted_bluetooth_blocked; then
-  echo "omarchy-t2-bcm4377-rebind: $DEV Bluetooth is rfkill-blocked, leaving it off"
-  exit 0
-fi
-
+# Load the driver even when Bluetooth is off. After a suspend nothing else
+# brings it back, and rfkill unblock cannot turn on a controller that is gone.
 modprobe hci_bcm4377 2>/dev/null || true
 
 if adapter_rfkill_blocked || persisted_bluetooth_blocked; then

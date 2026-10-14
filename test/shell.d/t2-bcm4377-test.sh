@@ -759,6 +759,7 @@ pass "a soft-blocked BCM4377 adapter is left off"
 
 setup_sysfs
 printf '1\n' >"$rfkill_dir/pci-0000:73:00.1:bluetooth"
+rm -rf "$sys/module/hci_bcm4377"
 set +e
 run_helper "$rebind"
 status=$?
@@ -768,7 +769,9 @@ assert_status 0 "$status" "a persisted soft block exits cleanly"
   fail "a persisted soft block does not unbind the adapter" "$(cat "$calls")"
 grep -Fq 'busctl' "$calls" &&
   fail "a persisted soft block does not power the adapter on" "$(cat "$calls")"
-pass "a persisted rfkill block for the BCM4377 function is left off"
+grep -Fq $'modprobe\thci_bcm4377' "$calls" ||
+  fail "a persisted soft block still loads the driver, so turning Bluetooth on after a wake has a controller" "$(cat "$calls")"
+pass "a persisted rfkill block for the BCM4377 function is left off, with the driver loaded"
 
 setup_sysfs
 set +e
